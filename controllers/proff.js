@@ -95,11 +95,12 @@ const setAvailability = async (req, res, next) => {
           professorId: new mongoose.Types.ObjectId(professorId),
           status: 'booked'
         },
-        { status: 'canceled' }  //  the status  needs to be canceled
+        { status: 'cancelled' },  // must match the enum in models/appointment.js
+        { runValidators: true }
       );
-  
+
       res.status(200).json({
-        message: `All appointments between professor ${professorId} and student ${studentId} have been canceled.,`
+        message: `All appointments between professor ${professorId} and student ${studentId} have been cancelled.`
       });
   
     } catch (error) {
@@ -107,4 +108,109 @@ const setAvailability = async (req, res, next) => {
       return next(new HttpError(error));
     }
   };
-export {setAvailability, cancelAppointments};
+// Parse a client-supplied date strictly (ISO 8601). Returns a Date or null.
+const parseIsoDate = (value) => {
+  if (typeof value !== "string") return null;
+  const parsed = moment(value, moment.ISO_8601, true);
+  return parsed.isValid() ? parsed.toDate() : null;
+};
+
+// Update an existing free availability slot in place (same document, same _id).
+// Only the professor who owns the slot may update it.
+const updateAvailability = async (req, res, next) => {
+  try {
+    const { availabilityId } = req.params;
+    const { startTime, endTime } = req.body;
+    const professorId = req.user.id;
+
+    if (!mongoose.Types.ObjectId.isValid(availabilityId)) {
+      return next(new HttpError("Invalid availability ID format", 400));
+    }
+    if (startTime === undefined && endTime === undefined) {
+      return next(new HttpError("Provide startTime and/or endTime to update", 400));
+    }
+
+    const availability = await Availability.findById(availabilityId);
+    if (!availability) {
+      return next(new HttpError("Availability slot not found", 404));
+    }
+    if (availability.professorId.toString() !== professorId) {
+      return next(new HttpError("You can only update your own availability", 403));
+    }
+
+    // Validate dates; fields not sent keep their current value
+    let newStart = availability.startTime;
+    let newEnd = availability.endTime;
+    if (startTime !== undefined) {
+      newStart = parseIsoDate(startTime);
+      if (!newStart) {
+        return next(new HttpError("startTime must be a valid ISO 8601 date, e.g. 2026-12-01T09:00:00Z", 400));
+      }
+    }
+    if (endTime !== undefined) {
+      newEnd = parseIsoDate(endTime);
+      if (!newEnd) {
+        return next(new HttpError("endTime must be a valid ISO 8601 date, e.g. 2026-12-01T12:00:00Z", 400));
+      }
+    }
+    if (newStart >= newEnd) {
+      return next(new HttpError("Start time must be before end time", 400));
+    }
+
+    // The new window must not overlap another of this professor's slots
+    const overlapping = await Availability.findOne({
+      _id: { $ne: availability._id },
+      professorId: availability.professorId,
+      startTime: { $lt: newEnd },
+      endTime: { $gt: newStart },
+    });
+    if (overlapping) {
+      return next(new HttpError("The new time overlaps another of your availability slots", 409));
+    }
+
+    // Booked appointments inside the current window must stay covered,
+    // either by the new window or by another of the professor's slots.
+    const bookedInSlot = await Appointment.find({
+      professorId: availability.professorId,
+      status: "booked",
+      time: { $gte: availability.startTime, $lte: availability.endTime },
+    });
+    if (bookedInSlot.length > 0) {
+      const otherSlots = await Availability.find({
+        _id: { $ne: availability._id },
+        professorId: availability.professorId,
+      });
+      const isCovered = (t, start, end) => t >= start && t <= end;
+      const orphaned = bookedInSlot.filter(
+        (appt) =>
+          !isCovered(appt.time, newStart, newEnd) &&
+          !otherSlots.some((s) => isCovered(appt.time, s.startTime, s.endTime))
+      );
+      if (orphaned.length > 0) {
+        return next(new HttpError(
+          `Cannot update: ${orphaned.length} booked appointment(s) would fall outside the new time range`,
+          409
+        ));
+      }
+    }
+
+    // Update the existing document in place; _id is unchanged
+    availability.startTime = newStart;
+    availability.endTime = newEnd;
+    await availability.save();
+
+    res.status(200).json({
+      message: "Availability updated successfully",
+      availability: {
+        ...availability.toObject(),
+        startTime: moment.utc(availability.startTime).format('MMMM Do YYYY, h:mm:ss a'),
+        endTime: moment.utc(availability.endTime).format('MMMM Do YYYY, h:mm:ss a'),
+      },
+    });
+  } catch (error) {
+    console.error("Error updating availability:", error);
+    return next(new HttpError("Updating availability failed", 500));
+  }
+};
+
+export {setAvailability, cancelAppointments, updateAvailability};

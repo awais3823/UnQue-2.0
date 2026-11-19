@@ -6,7 +6,9 @@ export const notFound = (req, res, next) => {
 };
 
 export const errorMiddleware = (err, req, res, next) => {
-    const statusCode = res.statusCode ? res.statusCode : 500;
+    const statusCode = Number.isInteger(err.code) && err.code >= 400 && err.code < 600
+        ? err.code
+        : (res.statusCode >= 400 ? res.statusCode : 500);
     res.status(statusCode).json({
         message: err.message
     });
